@@ -45,6 +45,20 @@
       - app-network
     restart: unless-stopped
 
+  # -- Frontend SPA (Next.js) --
+  frontend:
+    build: ./frontend
+    container_name: auto_ads_frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
 volumes:
   pgdata:
 
