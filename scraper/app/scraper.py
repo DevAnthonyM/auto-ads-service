@@ -1,417 +1,446 @@
-"""Web scraper for carsensor.net car listings.
-
-Uses Playwright for JavaScript-rendered pages with httpx as a lightweight fallback.
-Implements retry logic with exponential backoff via tenacity.
+"""
+CarSensor.net scraper — fetches used car listings from carsensor.net.
+Uses Playwright for JS-rendered pages, falls back to httpx + BeautifulSoup.
 """
 
 import asyncio
 import re
-
+from typing import Optional
+import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from app.config import settings
+# ---------------------------------------------------------------------------
+# Brand mapping — Japanese brand codes and name fragments to English names
+# ---------------------------------------------------------------------------
 
-# Base URL patterns for carsensor.net
-BASE_URL = "https://www.carsensor.net"
-LISTING_URL = f"{BASE_URL}/usedcar/index{{page}}.html"
-BRAND_URLS = [
-    f"{BASE_URL}/usedcar/bTO/s001/index{{page}}.html",  # Toyota Prius
-    f"{BASE_URL}/usedcar/bHO/s062/index{{page}}.html",  # Honda Fit
-    f"{BASE_URL}/usedcar/bNI/s049/index{{page}}.html",  # Nissan Note
-    f"{BASE_URL}/usedcar/bBM/index{{page}}.html",        # BMW
-    f"{BASE_URL}/usedcar/bMB/index{{page}}.html",        # Mercedes-Benz
+# carsensor.net URL brand codes → English brand names
+BRAND_CODE_MAP = {
+    "bTO": "Toyota",
+    "bHO": "Honda",
+    "bNI": "Nissan",
+    "bMA": "Mazda",
+    "bSU": "Subaru",
+    "bMI": "Mitsubishi",
+    "bDA": "Daihatsu",
+    "bSZ": "Suzuki",
+    "bIS": "Isuzu",
+    "bHI": "Hino",
+    "bLE": "Lexus",
+    "bBM": "BMW",
+    "bMB": "Mercedes",
+    "bAU": "Audi",
+    "bVW": "Volkswagen",
+    "bPG": "Peugeot",
+    "bMN": "MINI",
+    "bVO": "Volvo",
+    "bFO": "Ford",
+    "bJA": "Jaguar",
+    "bLR": "Land Rover",
+    "bPO": "Porsche",
+    "bFR": "Ferrari",
+    "bLM": "Lamborghini",
+    "bBC": "Bentley",
+    "bRR": "Rolls-Royce",
+    "bHY": "Hyundai",
+    "bKI": "Kia",
+}
+
+# Japanese text fragments → English brand names (for model field fallback)
+JAPANESE_BRAND_FRAGMENTS = {
+    "トヨタ": "Toyota", "toyota": "Toyota",
+    "ホンダ": "Honda", "honda": "Honda",
+    "日産": "Nissan", "nissan": "Nissan",
+    "マツダ": "Mazda", "mazda": "Mazda",
+    "スバル": "Subaru", "subaru": "Subaru",
+    "三菱": "Mitsubishi", "mitsubishi": "Mitsubishi",
+    "ダイハツ": "Daihatsu", "daihatsu": "Daihatsu",
+    "スズキ": "Suzuki", "suzuki": "Suzuki",
+    "レクサス": "Lexus", "lexus": "Lexus",
+    "BMW": "BMW", "bmw": "BMW",
+    "メルセデス": "Mercedes", "mercedes": "Mercedes",
+    "アウディ": "Audi", "audi": "Audi",
+    "フォルクスワーゲン": "Volkswagen", "volkswagen": "Volkswagen",
+    "プジョー": "Peugeot", "peugeot": "Peugeot",
+    "ミニ": "MINI", "mini": "MINI",
+    "ボルボ": "Volvo", "volvo": "Volvo",
+    "フォード": "Ford", "ford": "Ford",
+}
+
+# Target URLs — (brand_code, brand_name) pairs to scrape
+SCRAPE_TARGETS = [
+    ("bTO", "Toyota"),
+    ("bHO", "Honda"),
+    ("bNI", "Nissan"),
+    ("bMA", "Mazda"),
+    ("bSU", "Subaru"),
+    ("bMI", "Mitsubishi"),
+    ("bDA", "Daihatsu"),
+    ("bSZ", "Suzuki"),
+    ("bLE", "Lexus"),
+    ("bBM", "BMW"),
+    ("bMB", "Mercedes"),
 ]
+
+# Color mapping (Japanese → English)
+COLOR_MAP = {
+    "ホワイト": "White", "白": "White",
+    "ブラック": "Black", "黒": "Black",
+    "シルバー": "Silver", "銀": "Silver",
+    "レッド": "Red", "赤": "Red",
+    "ブルー": "Blue", "青": "Blue",
+    "グレー": "Gray", "グレイ": "Gray", "灰": "Gray",
+    "グリーン": "Green", "緑": "Green",
+    "イエロー": "Yellow", "黄": "Yellow",
+    "オレンジ": "Orange",
+    "ブラウン": "Brown", "茶": "Brown",
+    "ベージュ": "Beige",
+    "パープル": "Purple", "紫": "Purple",
+    "ゴールド": "Gold",
+    "ピンク": "Pink",
+    "white": "White", "black": "Black", "silver": "Silver",
+    "red": "Red", "blue": "Blue", "gray": "Gray", "grey": "Gray",
+    "green": "Green", "yellow": "Yellow", "orange": "Orange",
+}
+
+
+def normalize_color(raw: str) -> str:
+    if not raw:
+        return ""
+    raw_clean = raw.strip()
+    # Direct lookup
+    if raw_clean in COLOR_MAP:
+        return COLOR_MAP[raw_clean]
+    # Partial match
+    for jp, en in COLOR_MAP.items():
+        if jp in raw_clean:
+            return en
+    return raw_clean
+
+
+def normalize_price(raw: str) -> Optional[float]:
+    """Convert Japanese price formats to numeric yen value."""
+    if not raw:
+        return None
+    raw = raw.strip().replace(",", "").replace(" ", "")
+    # "150万円" or "150万" → 1,500,000
+    m = re.search(r"([\d.]+)万", raw)
+    if m:
+        return float(m.group(1)) * 10_000
+    # Raw numeric
+    m = re.search(r"([\d,]+)", raw.replace(",", ""))
+    if m:
+        val = float(m.group(1))
+        # If value looks like it's already in full yen (> 10000), keep it
+        # If it looks like man-en (< 5000 but nonzero), multiply by 10000
+        if 0 < val < 5000:
+            return val * 10_000
+        return val
+    return None
+
+
+def extract_external_id(link: str) -> Optional[str]:
+    """Extract unique listing ID from carsensor.net URL."""
+    m = re.search(r"/detail/([A-Z]{2}\d+)/", link)
+    if m:
+        return m.group(1)
+    # Fallback: use last URL segment
+    parts = link.rstrip("/").split("/")
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def detect_brand_from_url(url: str) -> Optional[str]:
+    """Detect brand from the URL brand code (most reliable method)."""
+    for code, brand in BRAND_CODE_MAP.items():
+        if f"/{code}/" in url:
+            return brand
+    return None
+
+
+def detect_brand_from_text(text: str) -> Optional[str]:
+    """Detect brand name from any text string (model name, title, etc.)."""
+    if not text:
+        return None
+    for fragment, brand in JAPANESE_BRAND_FRAGMENTS.items():
+        if fragment in text:
+            return brand
+    return None
 
 
 class CarSensorScraper:
-    """Scrapes car listings from carsensor.net.
-
-    Primary: Playwright (handles JS-rendered content)
-    Fallback: httpx + BeautifulSoup (for server-rendered pages)
+    """
+    Scraper for carsensor.net used car listings.
+    Uses Playwright for JS-rendered pages, falls back to httpx.
     """
 
-    def __init__(self):
-        self.scraped_count = 0
-        self.error_count = 0
+    BASE_URL = "https://www.carsensor.net/usedcar"
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
-        before_sleep=lambda retry_state: logger.warning(
-            f"Retry attempt {retry_state.attempt_number} after error: {retry_state.outcome.exception()}"
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
         ),
-    )
-    async def fetch_page_playwright(self, url: str) -> str:
-        """Fetch a page using Playwright (handles JavaScript rendering)."""
-        from playwright.async_api import async_playwright
+        "Accept-Language": "ja,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Safari/537.36"
-                )
-            )
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                content = await page.content()
-                return content
-            finally:
-                await browser.close()
+    KNOWN_SELECTORS = [
+        "div.cassetteWrap",
+        "div.carsensorCassetteWrap",
+        "div[class*='cassette']",
+        "li.cassetteItem",
+        "div.searchResult li",
+    ]
+
+    def __init__(self):
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            headers=self.HEADERS,
+            follow_redirects=True,
+        )
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        wait=wait_exponential(multiplier=1, min=2, max=8),
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, httpx.ReadTimeout)),
+        reraise=True,
     )
-    async def fetch_page_httpx(self, url: str) -> str:
-        """Fetch a page using httpx (lightweight, no JS rendering)."""
-        import httpx
-
-        async with httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "ja,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.text
+    async def fetch_with_httpx(self, url: str) -> str:
+        response = await self.client.get(url)
+        response.raise_for_status()
+        return response.text
 
     async def fetch_page(self, url: str) -> str:
-        """Fetch a page, trying Playwright first, then httpx fallback."""
+        """Fetch page HTML — tries Playwright first, falls back to httpx."""
         try:
-            logger.debug(f"Fetching with Playwright: {url}")
-            return await self.fetch_page_playwright(url)
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.set_extra_http_headers(self.HEADERS)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
+                content = await page.content()
+                await browser.close()
+                return content
         except Exception as e:
             logger.warning(f"Playwright failed ({e}), falling back to httpx")
-            try:
-                return await self.fetch_page_httpx(url)
-            except Exception as e2:
-                logger.error(f"httpx also failed: {e2}")
-                raise
+            return await self.fetch_with_httpx(url)
 
-    def parse_listings(self, html: str) -> list[dict]:
-        """Parse car listings from carsensor.net HTML.
-
-        Extracts: make, model, year, price, color, link from listing cards.
-        carsensor.net uses various CSS class patterns for their listing items.
+    def parse_listings(self, html: str, brand_name: str = None, page_url: str = None) -> list[dict]:
+        """
+        Parse car listings from HTML.
+        brand_name is passed in from the URL so make is always correctly set.
         """
         soup = BeautifulSoup(html, "lxml")
         cars = []
 
-        # carsensor.net listing cards — try multiple known selectors
-        # The site structure can change, so we try several patterns
-        selectors = [
-            "div.cassetteWrap",           # Main listing wrapper
-            "div.casetteArea",            # Alternative wrapper
-            "section.cassetteItem",       # Section-based cards
-            "div[data-vc-bkn]",           # Data-attribute based
-            "li.js-listItem",             # List item cards
-        ]
-
-        items = []
-        for selector in selectors:
+        # Find listing containers
+        container = None
+        for selector in self.KNOWN_SELECTORS:
             items = soup.select(selector)
             if items:
+                container = items
                 logger.info(f"Found {len(items)} listings using selector: {selector}")
                 break
 
-        if not items:
-            # Try generic approach — find all links to individual car pages
+        if not container:
             logger.warning("No listings found with known selectors, trying link-based extraction")
-            return self._parse_from_links(soup)
+            return self._extract_from_links(soup, brand_name)
 
-        for item in items:
+        for item in container:
             try:
-                car = self._extract_car_data(item)
+                car = self._parse_single_listing(item, brand_name, page_url)
                 if car and car.get("external_id"):
                     cars.append(car)
             except Exception as e:
-                logger.debug(f"Failed to parse listing item: {e}")
-                self.error_count += 1
+                logger.debug(f"Error parsing listing: {e}")
                 continue
 
         return cars
 
-    def _extract_car_data(self, item) -> dict | None:
-        """Extract car data from a single listing card element."""
-        car = {}
-
-        # Find the detail link — this gives us the external_id
+    def _parse_single_listing(self, item, brand_name: str = None, page_url: str = None) -> Optional[dict]:
+        """Parse a single car listing element."""
+        # --- Link and external ID ---
         link_el = item.select_one("a[href*='/usedcar/detail/']")
         if not link_el:
-            link_el = item.select_one("a[href*='BKN=']")
+            link_el = item.select_one("a[href*='carsensor.net']")
         if not link_el:
             return None
 
         href = link_el.get("href", "")
-        car["link"] = href if href.startswith("http") else f"{BASE_URL}{href}"
-        car["external_id"] = self._extract_external_id(href)
+        if not href.startswith("http"):
+            href = "https://www.carsensor.net" + href
 
-        # Extract make and model from title/heading text
-        title_el = (
-            item.select_one(".cassetteMain__title")
-            or item.select_one(".casetteItemTtl")
-            or item.select_one("h3")
-            or item.select_one(".carName")
-            or link_el
-        )
-        if title_el:
-            title_text = title_el.get_text(strip=True)
-            make, model = self._parse_make_model(title_text)
-            car["make"] = make
-            car["model"] = model
-
-        # Extract year
-        year_el = item.select_one(".cassetteMain__spec") or item.select_one(".year")
-        if year_el:
-            car["year"] = self._parse_year(year_el.get_text())
-        else:
-            # Try to find year anywhere in the card text
-            all_text = item.get_text()
-            car["year"] = self._parse_year(all_text)
-
-        # Extract price
-        price_el = (
-            item.select_one(".cassetteMain__priceValue")
-            or item.select_one(".priceWrap")
-            or item.select_one(".price")
-        )
-        if price_el:
-            car["price"] = self._parse_price(price_el.get_text())
-        else:
-            car["price"] = self._parse_price(item.get_text())
-
-        # Extract color
-        color_el = item.select_one(".color") or item.select_one("[class*='color']")
-        if color_el:
-            car["color"] = color_el.get_text(strip=True)
-        else:
-            car["color"] = self._extract_color_from_text(item.get_text())
-
-        # Store extra data
-        car["raw_data"] = {"source": "carsensor.net", "scraped_text": item.get_text()[:500]}
-
-        # Validate required fields
-        if not all(car.get(f) for f in ["make", "model", "year", "price", "link", "external_id"]):
+        external_id = extract_external_id(href)
+        if not external_id:
             return None
 
-        return car
+        # --- Make (brand) — use URL-derived brand_name as primary source ---
+        make = brand_name  # This is always correct since we pass it from the URL
 
-    def _parse_from_links(self, soup) -> list[dict]:
-        """Fallback: extract car data from individual detail page links."""
+        # --- Model name ---
+        model = ""
+        model_selectors = [
+            ".cassetteModelName", ".modelName", ".carName",
+            "h2", "h3", ".title", ".name",
+            "[class*='model']", "[class*='name']",
+        ]
+        for sel in model_selectors:
+            el = item.select_one(sel)
+            if el:
+                text = el.get_text(strip=True)
+                if text and len(text) > 2:
+                    model = text
+                    break
+
+        if not model:
+            # Fallback: get all text and clean it up
+            full_text = item.get_text(separator=" ", strip=True)
+            lines = [l.strip() for l in full_text.split() if len(l.strip()) > 3]
+            model = " ".join(lines[:5]) if lines else "Unknown Model"
+
+        # If make still not resolved, try detecting from model text
+        if not make:
+            make = detect_brand_from_text(model) or "Unknown"
+
+        # --- Price ---
+        price = None
+        price_selectors = [
+            ".price", ".totalPrice", "[class*='price']",
+            "span.price", "div.price", ".carPrice",
+        ]
+        for sel in price_selectors:
+            el = item.select_one(sel)
+            if el:
+                raw_price = el.get_text(strip=True)
+                price = normalize_price(raw_price)
+                if price:
+                    break
+
+        # Fallback: search for price pattern in full text
+        if not price:
+            full_text = item.get_text()
+            price = normalize_price(full_text)
+
+        # --- Year ---
+        year = None
+        full_text = item.get_text()
+        # Common patterns: "2020年", "2020年式", "令和2年"
+        year_match = re.search(r"(20\d{2}|19[89]\d)年", full_text)
+        if year_match:
+            year = int(year_match.group(1))
+        else:
+            # Reiwa era: 令和N年 (2019 + N)
+            reiwa = re.search(r"令和(\d+)年", full_text)
+            if reiwa:
+                year = 2018 + int(reiwa.group(1))
+            else:
+                # Heisei era: 平成N年 (1988 + N)
+                heisei = re.search(r"平成(\d+)年", full_text)
+                if heisei:
+                    year = 1988 + int(heisei.group(1))
+
+        # --- Color ---
+        color = ""
+        color_selectors = [".color", "[class*='color']", ".colorName"]
+        for sel in color_selectors:
+            el = item.select_one(sel)
+            if el:
+                color = normalize_color(el.get_text(strip=True))
+                if color:
+                    break
+
+        # Fallback: scan text for color keywords
+        if not color:
+            for jp_color, en_color in COLOR_MAP.items():
+                if jp_color in full_text:
+                    color = en_color
+                    break
+
+        # --- Raw extra data ---
+        raw_data = {
+            "html_snippet": str(item)[:500],
+        }
+        mileage_match = re.search(r"([\d,]+)\s*km", full_text)
+        if mileage_match:
+            raw_data["mileage_km"] = mileage_match.group(1).replace(",", "")
+
+        return {
+            "external_id": external_id,
+            "make": make or "Unknown",
+            "model": model,
+            "year": year,
+            "price": price,
+            "color": color,
+            "link": href,
+            "raw_data": raw_data,
+        }
+
+    def _extract_from_links(self, soup: BeautifulSoup, brand_name: str = None) -> list[dict]:
+        """Last-resort extraction based on detail page links."""
         cars = []
-        links = soup.select("a[href*='/usedcar/detail/']")
-        seen_ids = set()
-
+        links = soup.find_all("a", href=re.compile(r"/usedcar/detail/"))
+        seen = set()
         for link in links:
             href = link.get("href", "")
-            ext_id = self._extract_external_id(href)
-            if not ext_id or ext_id in seen_ids:
-                continue
-            seen_ids.add(ext_id)
-
-            text = link.get_text(strip=True)
-            if len(text) < 3:
-                continue
-
-            make, model = self._parse_make_model(text)
-            year = self._parse_year(text)
-            price = self._parse_price(text)
-
-            if make and year and price:
+            if not href.startswith("http"):
+                href = "https://www.carsensor.net" + href
+            ext_id = extract_external_id(href)
+            if ext_id and ext_id not in seen:
+                seen.add(ext_id)
                 cars.append({
                     "external_id": ext_id,
-                    "make": make,
-                    "model": model or "Unknown",
-                    "year": year,
-                    "price": price,
-                    "color": self._extract_color_from_text(text),
-                    "link": href if href.startswith("http") else f"{BASE_URL}{href}",
-                    "raw_data": {"source": "carsensor.net", "method": "link_extraction"},
+                    "make": brand_name or "Unknown",
+                    "model": link.get_text(strip=True) or "Unknown",
+                    "year": None,
+                    "price": None,
+                    "color": "",
+                    "link": href,
+                    "raw_data": {},
                 })
-
         return cars
 
-    @staticmethod
-    def _extract_external_id(url: str) -> str:
-        """Extract unique car ID from carsensor.net URL."""
-        # Pattern: /usedcar/detail/CU1234567890/
-        match = re.search(r"(CU\d+|BKN=\w+|\d{10,})", url)
-        if match:
-            return match.group(1).replace("BKN=", "")
-        # Use URL hash as fallback
-        return str(hash(url))[-12:] if url else ""
-
-    @staticmethod
-    def _parse_make_model(text: str) -> tuple[str, str]:
-        """Parse Japanese car make and model from listing title.
-
-        Maps Japanese brand names to English equivalents.
-        """
-        japanese_to_english = {
-            "トヨタ": "Toyota", "ホンダ": "Honda", "日産": "Nissan",
-            "マツダ": "Mazda", "スバル": "Subaru", "三菱": "Mitsubishi",
-            "スズキ": "Suzuki", "ダイハツ": "Daihatsu", "レクサス": "Lexus",
-            "BMW": "BMW", "メルセデス・ベンツ": "Mercedes-Benz",
-            "メルセデスベンツ": "Mercedes-Benz",
-            "アウディ": "Audi", "フォルクスワーゲン": "Volkswagen",
-            "ポルシェ": "Porsche", "ボルボ": "Volvo", "ミニ": "Mini",
-            "フィアット": "Fiat", "プジョー": "Peugeot",
-            "ランドローバー": "Land Rover", "ジャガー": "Jaguar",
-        }
-
-        make = "Unknown"
-        model = text.strip()
-
-        for jp_name, en_name in japanese_to_english.items():
-            if jp_name in text:
-                make = en_name
-                model = text.replace(jp_name, "").strip()
-                break
-
-        # Also check for English brand names directly
-        english_brands = [
-            "Toyota", "Honda", "Nissan", "Mazda", "Subaru", "Mitsubishi",
-            "Suzuki", "Daihatsu", "Lexus", "BMW", "Mercedes", "Audi",
-            "Volkswagen", "Porsche", "Volvo", "Mini", "Fiat",
-        ]
-        for brand in english_brands:
-            if brand.lower() in text.lower():
-                make = brand
-                model = re.sub(re.escape(brand), "", text, flags=re.IGNORECASE).strip()
-                break
-
-        # Clean up model name
-        model = model[:100] if model else "Unknown"
-        return make, model
-
-    @staticmethod
-    def _parse_year(text: str) -> int:
-        """Extract manufacturing year from Japanese text.
-
-        Handles patterns like: 2024(R06)年, 2020年式, H30年, R03年, 2022
-        """
-        # Western year: 2020, 2024, etc.
-        match = re.search(r"(19[89]\d|20[0-2]\d)", text)
-        if match:
-            return int(match.group(1))
-
-        # Japanese era year: R03 -> 2021, H30 -> 2018
-        reiwa = re.search(r"R\.?(\d{1,2})", text)
-        if reiwa:
-            return 2018 + int(reiwa.group(1))
-
-        heisei = re.search(r"H\.?(\d{1,2})", text)
-        if heisei:
-            return 1988 + int(heisei.group(1))
-
-        return 2024  # Default to current-ish year
-
-    @staticmethod
-    def _parse_price(text: str) -> float:
-        """Extract price in JPY from Japanese price text.
-
-        Handles: 150万円 -> 1500000, 150.5万円 -> 1505000,
-                 1,500,000円 -> 1500000, 応談 -> 0
-        """
-        #万円 (man-en) = 10,000 yen units
-        man_match = re.search(r"([\d,.]+)\s*万", text)
-        if man_match:
-            value = float(man_match.group(1).replace(",", ""))
-            return value * 10000
-
-        # Direct yen amount
-        yen_match = re.search(r"([\d,]+)\s*円", text)
-        if yen_match:
-            return float(yen_match.group(1).replace(",", ""))
-
-        # Just a number
-        num_match = re.search(r"([\d,]+\.?\d*)", text)
-        if num_match:
-            val = float(num_match.group(1).replace(",", ""))
-            if val < 10000:  # Likely in 万 units
-                return val * 10000
-            return val
-
-        return 0
-
-    @staticmethod
-    def _extract_color_from_text(text: str) -> str | None:
-        """Extract car color from Japanese text."""
-        color_map = {
-            "ブラック": "Black", "黒": "Black",
-            "ホワイト": "White", "白": "White",
-            "シルバー": "Silver", "銀": "Silver",
-            "レッド": "Red", "赤": "Red",
-            "ブルー": "Blue", "青": "Blue",
-            "グレー": "Gray", "灰": "Gray",
-            "グリーン": "Green", "緑": "Green",
-            "イエロー": "Yellow", "黄": "Yellow",
-            "ブラウン": "Brown", "茶": "Brown",
-            "パール": "Pearl White",
-            "ベージュ": "Beige",
-            "ゴールド": "Gold",
-            "オレンジ": "Orange",
-            "ワインレッド": "Wine Red",
-            "ガンメタリック": "Gunmetal",
-        }
-        for jp, en in color_map.items():
-            if jp in text:
-                return en
-        return None
-
     async def scrape_listings(self, max_pages: int = 5) -> list[dict]:
-        """Scrape car listings from multiple pages.
-
-        Rate limits requests to avoid overloading the server.
+        """
+        Main scraping method — iterates over all brands and pages.
+        Passes brand_name to parse_listings so make is always correct.
         """
         all_cars = []
-        seen_ids = set()
+        errors = 0
 
-        urls_to_scrape = []
-        for brand_url_template in BRAND_URLS[:3]:  # Limit to 3 brands for speed
+        for brand_code, brand_name in SCRAPE_TARGETS:
             for page_num in range(1, max_pages + 1):
-                page_suffix = "" if page_num == 1 else str(page_num)
-                url = brand_url_template.replace("{page}", page_suffix)
-                urls_to_scrape.append(url)
+                if page_num == 1:
+                    url = f"{self.BASE_URL}/{brand_code}/s001/index.html"
+                else:
+                    url = f"{self.BASE_URL}/{brand_code}/s001/index{page_num}.html"
 
-        for url in urls_to_scrape:
-            try:
-                logger.info(f"Scraping: {url}")
-                html = await self.fetch_page(url)
-                cars = self.parse_listings(html)
+                try:
+                    logger.info(f"Scraping [{brand_name} p{page_num}]: {url}")
+                    html = await self.fetch_page(url)
+                    cars = self.parse_listings(html, brand_name=brand_name, page_url=url)
+                    logger.info(f"Found {len(cars)} cars on page")
 
-                for car in cars:
-                    if car["external_id"] not in seen_ids:
-                        seen_ids.add(car["external_id"])
-                        all_cars.append(car)
-                        self.scraped_count += 1
+                    if len(cars) == 0:
+                        # No listings found — probably end of results for this brand
+                        break
 
-                logger.info(f"Found {len(cars)} cars on page")
+                    all_cars.extend(cars)
+                    await asyncio.sleep(2)  # Rate limiting
 
-                # Rate limiting — be respectful to the server
-                await asyncio.sleep(2)
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"Error scraping {url}: {e}")
+                    if errors >= 5:
+                        logger.warning("Too many errors, stopping scrape early")
+                        break
+                    continue
 
-            except Exception as e:
-                logger.error(f"Failed to scrape {url}: {e}")
-                self.error_count += 1
-                continue
-
-        logger.info(
-            f"Scraping complete: {self.scraped_count} cars found, {self.error_count} errors"
-        )
+        logger.info(f"Scraping complete: {len(all_cars)} cars found, {errors} errors")
         return all_cars
+
+    async def close(self):
+        await self.client.aclose()

@@ -59,6 +59,18 @@
       - app-network
     restart: unless-stopped
 
+  # -- Telegram Bot --
+  telegram-bot:
+    build: ./telegram-bot
+    container_name: auto_ads_telegram_bot
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
 volumes:
   pgdata:
 
