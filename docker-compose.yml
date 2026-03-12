@@ -33,6 +33,18 @@
       - app-network
     restart: unless-stopped
 
+  # -- Scraper (carsensor.net) --
+  scraper:
+    build: ./scraper
+    container_name: auto_ads_scraper
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
 volumes:
   pgdata:
 
